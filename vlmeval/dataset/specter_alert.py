@@ -3,7 +3,12 @@ from ..smp import *
 import re
 import glob
 import json
+import logging
+import os
 from typing import Optional, Dict, Any, List
+
+import numpy as np
+from PIL import Image
 
 
 class SpecterAlertDataset:
@@ -22,8 +27,15 @@ class SpecterAlertDataset:
     - video_path points to either:
       - a frames directory with frame_{timestamp}.jpg files, or
       - a video file (e.g. video.mp4)
-    - metadata_path points to metadata.json with detection paths
-    - rule_definition_path points to rule_definition.json with prompt metadata
+    - metadata_path points to metadata.json with:
+      - sample metadata (ground_truth, feature_type, etc.)
+      - detection_metadata_paths: paths to per-frame detection JSONs
+    - rule_definition_path points to rule_definition.json with:
+      - prompt_config or processor: config name for EventProcessor (e.g. "fire_event_processor")
+      - prompt_version: version tag for specter_prompts (e.g. "0.0.28", or null for latest)
+      - processor_type: type of processor (e.g. "detectFire")
+      - conditions: rule conditions for the processor
+    - Optional: vlm.json in clip directory with prompt_text as fallback question
 
     The dataset evaluates VLM predictions by extracting answers from <answer> tags
     and comparing to ground truth (yes/no).
@@ -63,10 +75,13 @@ class SpecterAlertDataset:
         Load dataset from local path.
         Expects:
         - TSV file at {LMUDataRoot()}/{dataset_name}.tsv
-        - Clips at {LMUDataRoot()}/{dataset_name}/clips/{sample_id}/
+        - Sample clips at {LMUDataRoot()}/{dataset_name}/clips/{sample_id}/
           - frames/frame_{timestamp}.jpg
           - detections/frame_{timestamp}.json
           - metadata.json
+          - video.mp4
+          - rule_definition.json
+          - vlm.json (optional)
         """
         lmu_root = LMUDataRoot()
         data_file = osp.join(lmu_root, f'{dataset_name}.tsv')
@@ -127,6 +142,89 @@ class SpecterAlertDataset:
 
         return resolved
 
+    def _fallback_detection_paths(
+        self,
+        frame_paths: List[str],
+        metadata_path: str,
+    ) -> List[str]:
+        """Fallback to detections/ folder when metadata omits detection paths."""
+        if not frame_paths:
+            return []
+        metadata_dir = osp.dirname(metadata_path) if metadata_path else ""
+        detections_dir = osp.join(metadata_dir, "detections") if metadata_dir else ""
+        if not detections_dir or not osp.exists(detections_dir):
+            return []
+
+        detection_paths = []
+        for frame_path in frame_paths:
+            frame_name = osp.basename(frame_path)
+            detection_name = osp.splitext(frame_name)[0] + ".json"
+            detection_path = osp.join(detections_dir, detection_name)
+            detection_paths.append(detection_path)
+        return detection_paths
+
+    def _sample_video_frames(self, video_path: str) -> List[str]:
+        """Sample frames from a video file and return saved frame paths."""
+        try:
+            from decord import VideoReader, cpu
+        except Exception as exc:
+            logging.warning(f"Failed to import decord for video sampling: {exc}")
+            return []
+
+        if self.fps > 0 and self.nframe > 0:
+            raise ValueError('fps and nframe should not be set at the same time')
+
+        try:
+            vid = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+        except Exception as exc:
+            logging.warning(f"Failed to open video {video_path}: {exc}")
+            return []
+
+        total_frames = len(vid)
+        if total_frames == 0:
+            logging.warning(f"Video has zero frames: {video_path}")
+            return []
+
+        if self.fps > 0:
+            video_fps = vid.get_avg_fps()
+            total_duration = total_frames / video_fps if video_fps else 0
+            required_frames = int(total_duration * self.fps) if total_duration > 0 else 0
+            if required_frames <= 0:
+                logging.warning(f"Computed zero frames for video: {video_path}")
+                return []
+            step_size = video_fps / self.fps if self.fps else 1
+            indices = [int(i * step_size) for i in range(required_frames)]
+        elif self.nframe > 0:
+            step_size = total_frames / (self.nframe + 1)
+            indices = [int(i * step_size) for i in range(1, self.nframe + 1)]
+        else:
+            indices = list(range(total_frames))
+
+        indices = [i for i in indices if 0 <= i < total_frames]
+        if not indices:
+            logging.warning(f"No valid frame indices for video: {video_path}")
+            return []
+
+        frames_dir = osp.join(osp.dirname(video_path), 'frames_sampled')
+        os.makedirs(frames_dir, exist_ok=True)
+        frame_paths = [osp.join(frames_dir, f'frame_{idx}.jpg') for idx in indices]
+
+        # Skip if already sampled
+        if np.all([osp.exists(p) for p in frame_paths]):
+            return frame_paths
+
+        try:
+            images = [vid[i].asnumpy() for i in indices]
+            images = [Image.fromarray(arr) for arr in images]
+            for im, pth in zip(images, frame_paths):
+                if not osp.exists(pth):
+                    im.save(pth)
+        except Exception as exc:
+            logging.warning(f"Failed to sample frames from video {video_path}: {exc}")
+            return []
+
+        return frame_paths
+
     def build_prompt(self, line, video_llm=False):
         """Build prompt for processor-wrapped inference.
 
@@ -147,6 +245,7 @@ class SpecterAlertDataset:
             - 'original_question': Fallback prompt text if config_name is empty
             - 'detection_paths': Local paths to detection metadata JSONs
             - 'rule_definition_path': Path to rule_definition.json (optional)
+            - 'prompt_version': Version of specter_prompts to use (optional)
         """
         if isinstance(line, int):
             assert line < len(self)
@@ -156,15 +255,38 @@ class SpecterAlertDataset:
         metadata_path = self._resolve_path(line.get('metadata_path', ''))
         rule_definition_path = self._resolve_path(line.get('rule_definition_path', ''))
 
+        # Load rule_definition.json for prompt_config and prompt_version
         rule_definition = {}
         if rule_definition_path and osp.exists(rule_definition_path):
             with open(rule_definition_path, 'r') as f:
                 rule_definition = json.load(f)
 
-        config_name = rule_definition.get('prompt_config', '')
+        # Handle both old "processor" field and new "prompt_config" field
+        config_name = rule_definition.get('prompt_config') or rule_definition.get('processor', '')
+        # prompt_version can be null (use latest) or a version string
+        # Convert None to empty string for consistency
+        prompt_version = rule_definition.get('prompt_version') or ''
+        
+        # Load original_question from vlm.json if available, otherwise from rule_definition
         original_question = rule_definition.get('prompt_text', '')
+        if video_path:
+            # Try to find vlm.json in the same directory as video_path
+            if osp.isdir(video_path):
+                vlm_json_path = osp.join(osp.dirname(video_path), 'vlm.json')
+            else:
+                vlm_json_path = osp.join(osp.dirname(video_path), 'vlm.json')
+            
+            if osp.exists(vlm_json_path):
+                try:
+                    with open(vlm_json_path, 'r') as f:
+                        vlm_data = json.load(f)
+                    # Use prompt_text from vlm.json as original_question
+                    if 'prompt_text' in vlm_data and vlm_data['prompt_text']:
+                        original_question = vlm_data['prompt_text']
+                except (OSError, json.JSONDecodeError):
+                    pass
 
-        # Load detection paths from metadata.json
+        # Load detection paths from metadata.json (fallback to detections/ folder)
         detection_paths = self._load_detection_paths_from_metadata(metadata_path)
 
         # Build message for ProcessorCloudVLM wrapper
@@ -172,14 +294,29 @@ class SpecterAlertDataset:
         if video_path and osp.isdir(video_path):
             frame_paths = self._load_frame_paths_from_dir(video_path)
             message.extend([dict(type='image', value=frame) for frame in frame_paths])
+            logging.info(f"SpecterAlert: using {len(frame_paths)} frames from dir {video_path}")
         elif video_path:
-            message.append(dict(type='video', value=video_path))
+            frame_paths = self._sample_video_frames(video_path)
+            message.extend([dict(type='image', value=frame) for frame in frame_paths])
+            logging.info(f"SpecterAlert: sampled {len(frame_paths)} frames from video {video_path}")
+        else:
+            frame_paths = []
+
+        if not detection_paths and frame_paths:
+            detection_paths = self._fallback_detection_paths(frame_paths, metadata_path)
+            if detection_paths:
+                logging.info(
+                    f"SpecterAlert: using {len(detection_paths)} detections from folder "
+                    f"for {video_path or metadata_path}"
+                )
 
         message.append(dict(type='config_name', value=config_name))
         message.append(dict(type='original_question', value=original_question))
         message.append(dict(type='detection_paths', value=detection_paths))
         if rule_definition_path:
             message.append(dict(type='rule_definition_path', value=rule_definition_path))
+        if prompt_version:
+            message.append(dict(type='prompt_version', value=prompt_version))
 
         return message
 
