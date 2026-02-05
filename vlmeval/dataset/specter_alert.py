@@ -8,7 +8,6 @@ import os
 from typing import Optional, Dict, Any, List
 
 import numpy as np
-from PIL import Image
 
 
 class SpecterAlertDataset:
@@ -24,9 +23,7 @@ class SpecterAlertDataset:
 
     Expected data format:
     - TSV with columns: index, video_path, metadata_path, rule_definition_path, answer
-    - video_path points to either:
-      - a frames directory with frame_{timestamp}.jpg files, or
-      - a video file (e.g. video.mp4)
+    - video_path points to a frames directory with frame_{timestamp}.jpg files
     - metadata_path points to metadata.json with:
       - sample metadata (ground_truth, feature_type, etc.)
       - detection_metadata_paths: paths to per-frame detection JSONs
@@ -36,6 +33,7 @@ class SpecterAlertDataset:
       - processor_type: type of processor (e.g. "detectFire")
       - conditions: rule conditions for the processor
     - Optional: vlm.json in clip directory with prompt_text as fallback question
+    - Optional: eval-config prompt overrides by source_key/processor_type
 
     The dataset evaluates VLM predictions by extracting answers from <answer> tags
     and comparing to ground truth (yes/no).
@@ -44,10 +42,13 @@ class SpecterAlertDataset:
     MODALITY = 'VIDEO'
     TYPE = 'Video-VQA'
 
-    def __init__(self, dataset='SpecterAlert', nframe=8, fps=-1):
+    def __init__(
+        self,
+        dataset='SpecterAlert',
+        prompt_config_overrides: Optional[Dict[str, Any]] = None,
+    ):
         self.dataset_name = dataset
-        self.nframe = nframe
-        self.fps = fps
+        self.prompt_config_overrides = prompt_config_overrides or {}
 
         ret = self.prepare_dataset(dataset)
         assert ret is not None
@@ -79,7 +80,6 @@ class SpecterAlertDataset:
           - frames/frame_{timestamp}.jpg
           - detections/frame_{timestamp}.json
           - metadata.json
-          - video.mp4
           - rule_definition.json
           - vlm.json (optional)
         """
@@ -104,6 +104,29 @@ class SpecterAlertDataset:
             lmu_root = osp.dirname(self.data_root)
             return osp.join(lmu_root, path_value)
         return osp.join(self.data_root, path_value)
+
+    def _load_metadata(self, metadata_path: str) -> Dict[str, Any]:
+        if not metadata_path or not osp.exists(metadata_path):
+            return {}
+        try:
+            with open(metadata_path, 'r') as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _resolve_prompt_config_override(
+        self,
+        source_key: str,
+        processor_type: str,
+    ) -> str:
+        overrides = self.prompt_config_overrides or {}
+        source_overrides = overrides.get('source_key') or {}
+        processor_overrides = overrides.get('processor_type') or {}
+        if source_key and source_key in source_overrides:
+            return source_overrides.get(source_key, '')
+        if processor_type and processor_type in processor_overrides:
+            return processor_overrides.get(processor_type, '')
+        return overrides.get('default', '') or ''
 
     def _load_frame_paths_from_dir(self, frame_dir: str) -> List[str]:
         """Load pre-extracted frame paths from a directory."""
@@ -163,68 +186,6 @@ class SpecterAlertDataset:
             detection_paths.append(detection_path)
         return detection_paths
 
-    def _sample_video_frames(self, video_path: str) -> List[str]:
-        """Sample frames from a video file and return saved frame paths."""
-        try:
-            from decord import VideoReader, cpu
-        except Exception as exc:
-            logging.warning(f"Failed to import decord for video sampling: {exc}")
-            return []
-
-        if self.fps > 0 and self.nframe > 0:
-            raise ValueError('fps and nframe should not be set at the same time')
-
-        try:
-            vid = VideoReader(video_path, ctx=cpu(0), num_threads=1)
-        except Exception as exc:
-            logging.warning(f"Failed to open video {video_path}: {exc}")
-            return []
-
-        total_frames = len(vid)
-        if total_frames == 0:
-            logging.warning(f"Video has zero frames: {video_path}")
-            return []
-
-        if self.fps > 0:
-            video_fps = vid.get_avg_fps()
-            total_duration = total_frames / video_fps if video_fps else 0
-            required_frames = int(total_duration * self.fps) if total_duration > 0 else 0
-            if required_frames <= 0:
-                logging.warning(f"Computed zero frames for video: {video_path}")
-                return []
-            step_size = video_fps / self.fps if self.fps else 1
-            indices = [int(i * step_size) for i in range(required_frames)]
-        elif self.nframe > 0:
-            step_size = total_frames / (self.nframe + 1)
-            indices = [int(i * step_size) for i in range(1, self.nframe + 1)]
-        else:
-            indices = list(range(total_frames))
-
-        indices = [i for i in indices if 0 <= i < total_frames]
-        if not indices:
-            logging.warning(f"No valid frame indices for video: {video_path}")
-            return []
-
-        frames_dir = osp.join(osp.dirname(video_path), 'frames_sampled')
-        os.makedirs(frames_dir, exist_ok=True)
-        frame_paths = [osp.join(frames_dir, f'frame_{idx}.jpg') for idx in indices]
-
-        # Skip if already sampled
-        if np.all([osp.exists(p) for p in frame_paths]):
-            return frame_paths
-
-        try:
-            images = [vid[i].asnumpy() for i in indices]
-            images = [Image.fromarray(arr) for arr in images]
-            for im, pth in zip(images, frame_paths):
-                if not osp.exists(pth):
-                    im.save(pth)
-        except Exception as exc:
-            logging.warning(f"Failed to sample frames from video {video_path}: {exc}")
-            return []
-
-        return frame_paths
-
     def build_prompt(self, line, video_llm=False):
         """Build prompt for processor-wrapped inference.
 
@@ -242,6 +203,7 @@ class SpecterAlertDataset:
             List of message dicts with types:
             - 'image' or 'video': Frame file paths or a video file
             - 'config_name': EventProcessor config name for Hydra instantiation
+            - 'override_config_name': Optional override for config_name
             - 'original_question': Fallback prompt text if config_name is empty
             - 'detection_paths': Local paths to detection metadata JSONs
             - 'rule_definition_path': Path to rule_definition.json (optional)
@@ -267,6 +229,14 @@ class SpecterAlertDataset:
         # Convert None to empty string for consistency
         prompt_version = rule_definition.get('prompt_version') or ''
         
+        # Resolve per-source/type prompt overrides (eval-config driven)
+        metadata = self._load_metadata(metadata_path)
+        source_key = metadata.get('source_key', '')
+        processor_type = rule_definition.get('processor_type') or metadata.get('feature_type', '')
+        override_config_name = self._resolve_prompt_config_override(source_key, processor_type)
+        if override_config_name:
+            config_name = override_config_name
+
         # Load original_question from vlm.json if available, otherwise from rule_definition
         original_question = rule_definition.get('prompt_text', '')
         if video_path:
@@ -295,10 +265,6 @@ class SpecterAlertDataset:
             frame_paths = self._load_frame_paths_from_dir(video_path)
             message.extend([dict(type='image', value=frame) for frame in frame_paths])
             logging.info(f"SpecterAlert: using {len(frame_paths)} frames from dir {video_path}")
-        elif video_path:
-            frame_paths = self._sample_video_frames(video_path)
-            message.extend([dict(type='image', value=frame) for frame in frame_paths])
-            logging.info(f"SpecterAlert: sampled {len(frame_paths)} frames from video {video_path}")
         else:
             frame_paths = []
 
@@ -311,6 +277,8 @@ class SpecterAlertDataset:
                 )
 
         message.append(dict(type='config_name', value=config_name))
+        if override_config_name:
+            message.append(dict(type='override_config_name', value=override_config_name))
         message.append(dict(type='original_question', value=original_question))
         message.append(dict(type='detection_paths', value=detection_paths))
         if rule_definition_path:
